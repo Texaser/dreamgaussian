@@ -3,7 +3,7 @@ import cv2
 import time
 import tqdm
 import numpy as np
-import dearpygui.dearpygui as dpg
+# import dearpygui.dearpygui as dpg
 
 import torch
 import torch.nn.functional as F
@@ -417,7 +417,7 @@ class GUI:
             import nvdiffrast.torch as dr
 
             if not self.opt.force_cuda_rast and (not self.opt.gui or os.name == 'nt'):
-                glctx = dr.RasterizeGLContext()
+                glctx = dr.RasterizeCudaContext()
             else:
                 glctx = dr.RasterizeCudaContext()
 
