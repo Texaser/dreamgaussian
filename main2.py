@@ -3,7 +3,9 @@ import cv2
 import time
 import tqdm
 import numpy as np
-import dearpygui.dearpygui as dpg
+import random
+import math
+# import dearpygui.dearpygui as dpg
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +21,7 @@ from mesh_renderer import Renderer
 class GUI:
     def __init__(self, opt):
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
+        os.system(f'CUDA_VISIBLE_DEVICES={self.opt.gpu}')
         self.gui = opt.gui # enable gui
         self.W = opt.W
         self.H = opt.H
@@ -35,6 +38,7 @@ class GUI:
         self.bg_remover = None
 
         self.guidance_sd = None
+        self.guidance_mv = None
         self.guidance_zero123 = None
 
         self.enable_sd = False
@@ -50,6 +54,27 @@ class GUI:
         self.input_mask_torch = None
         self.overlay_input_img = False
         self.overlay_input_img_ratio = 0.5
+
+        # camera settings
+        self.n_view = 4
+        self.height: Any = 64
+        self.width: Any = 64
+        self.batch_size: Any = 4
+        self.real_batch_size = self.batch_size // self.n_view
+        self.elevation_range: Tuple[float, float] = (-30, 30)
+        self.azimuth_range: Tuple[float, float] = (-180, 180)
+        self.camera_distance_range: Tuple[float, float] = (0.8, 1.0)
+        self.fovy_range: Tuple[float, float] = (
+            15,
+            60,
+        )  # in degrees, in vertical direction (along height)
+        self.camera_perturb: float = 0
+        self.center_perturb: float = 0
+        self.up_perturb: float = 0
+        self.eval_elevation_deg: float = 15.0
+        self.eval_camera_distance: float = 3.0
+        self.eval_fovy_deg: float = 40.0
+        self.batch_uniform_azimuth: bool = True
 
         # input text
         self.prompt = ""
@@ -107,14 +132,33 @@ class GUI:
         
 
         self.enable_sd = self.opt.lambda_sd > 0 and self.prompt != ""
+        self.enable_mv = self.opt.lambda_mv > 0 and self.prompt != ""
         self.enable_zero123 = self.opt.lambda_zero123 > 0 and self.input_img is not None
 
         # lazy load guidance model
         if self.guidance_sd is None and self.enable_sd:
-            print(f"[INFO] loading SD...")
-            from guidance.sd_utils import StableDiffusion
-            self.guidance_sd = StableDiffusion(self.device)
-            print(f"[INFO] loaded SD!")
+            if self.opt.mvdream:
+                print(f"[INFO] loading MVDream...")
+                from guidance.mvdream_utils import MVDream
+                self.guidance_sd = MVDream(self.device)
+                print(f"[INFO] loaded MVDream!")
+            else:
+                print(f"[INFO] loading SD...")
+                from guidance.sd_utils import StableDiffusion
+                self.guidance_sd = StableDiffusion(self.device)
+                print(f"[INFO] loaded SD!")
+
+        if self.guidance_mv is None and self.enable_mv:
+            print(f"[INFO] loading MV...")
+            from guidance.mv_utils import MultiviewDiffusionGuidance
+            self.guidance_mv = MultiviewDiffusionGuidance(self.device)
+            print(f"[INFO] loaded MV!")
+
+        if self.guidance_mv is None and self.enable_mv:
+            print(f"[INFO] loading MV...")
+            from guidance.mv_utils import MultiviewDiffusionGuidance
+            self.guidance_mv = MultiviewDiffusionGuidance(self.device)
+            print(f"[INFO] loaded MV!")
 
         if self.guidance_zero123 is None and self.enable_zero123:
             print(f"[INFO] loading zero123...")
@@ -125,14 +169,10 @@ class GUI:
         # input image
         if self.input_img is not None:
             self.input_img_torch = torch.from_numpy(self.input_img).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            self.input_img_torch = F.interpolate(
-                self.input_img_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False
-            )
+            self.input_img_torch = F.interpolate(self.input_img_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
 
             self.input_mask_torch = torch.from_numpy(self.input_mask).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            self.input_mask_torch = F.interpolate(
-                self.input_mask_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False
-            )
+            self.input_mask_torch = F.interpolate(self.input_mask_torch, (self.opt.ref_size, self.opt.ref_size), mode="bilinear", align_corners=False)
             self.input_img_torch_channel_last = self.input_img_torch[0].permute(1,2,0).contiguous()
 
         # prepare embeddings
@@ -140,6 +180,9 @@ class GUI:
 
             if self.enable_sd:
                 self.guidance_sd.get_text_embeds([self.prompt], [self.negative_prompt])
+
+            if self.enable_mv:
+                self.guidance_mv.get_text_embeds([self.prompt], [self.negative_prompt])
 
             if self.enable_zero123:
                 self.guidance_zero123.get_img_embeds(self.input_img_torch)
@@ -175,18 +218,142 @@ class GUI:
             # avoid too large elevation (> 80 or < -80), and make sure it always cover [-30, 30]
             min_ver = max(min(-30, -30 - self.opt.elevation), -80 - self.opt.elevation)
             max_ver = min(max(30, 30 - self.opt.elevation), 80 - self.opt.elevation)
-            for _ in range(self.opt.batch_size):
+            # vers, hors, radii = [], [], []
+            # # avoid too large elevation (> 80 or < -80), and make sure it always cover [-30, 30]
+            # min_ver = max(min(-30, -30 - self.opt.elevation), -80 - self.opt.elevation)
+            # max_ver = min(max(30, 30 - self.opt.elevation), 80 - self.opt.elevation)
 
-                # render random view
-                ver = np.random.randint(min_ver, max_ver)
-                hor = np.random.randint(-180, 180)
+            if random.random() < 0.5:
+                # sample elevation angles uniformly with a probability 0.5 (biased towards poles)
+                elevation_deg = (
+                    torch.rand(self.real_batch_size)
+                    * (self.elevation_range[1] - self.elevation_range[0])
+                    + self.elevation_range[0]
+                ).repeat_interleave(self.n_view, dim=0)
+                elevation = elevation_deg * math.pi / 180
+            else:
+                # otherwise sample uniformly on sphere
+                elevation_range_percent = [
+                    (self.elevation_range[0] + 90.0) / 180.0,
+                    (self.elevation_range[1] + 90.0) / 180.0,
+                ]
+                # inverse transform sampling
+                elevation = torch.asin(
+                    2
+                    * (
+                        torch.rand(self.real_batch_size)
+                        * (elevation_range_percent[1] - elevation_range_percent[0])
+                        + elevation_range_percent[0]
+                    )
+                    - 1.0
+                ).repeat_interleave(self.n_view, dim=0)
+                elevation_deg = elevation / math.pi * 180.0
+            if self.batch_uniform_azimuth:
+            # ensures sampled azimuth angles in a batch cover the whole range
+                azimuth_deg = (
+                    torch.rand(self.batch_size) + torch.arange(self.batch_size)
+                ) / self.batch_size * (
+                    self.azimuth_range[1] - self.azimuth_range[0]
+                ) + self.azimuth_range[
+                    0
+                ]
+            else:
+                # simple random sampling
+                azimuth_deg = (
+                    torch.rand(self.batch_size)
+                    * (self.azimuth_range[1] - self.azimuth_range[0])
+                    + self.azimuth_range[0]
+                )
+            azimuth = azimuth_deg * math.pi / 180
+            
+            # sample distances from a uniform distribution bounded by distance_range
+            # Float[Tensor, "B"]
+            camera_distances = (
+                torch.rand(self.batch_size)
+                * (self.camera_distance_range[1] - self.camera_distance_range[0])
+                + self.camera_distance_range[0]
+            )
+
+            # convert spherical coordinates to cartesian coordinates
+            # right hand coordinate system, x back, y right, z up
+            # elevation in (-90, 90), azimuth from +x to +y in (-180, 180)
+            # Float[Tensor, "B 3"]
+            camera_positions = torch.stack(
+                [
+                    camera_distances * torch.cos(elevation) * torch.cos(azimuth),
+                    camera_distances * torch.cos(elevation) * torch.sin(azimuth),
+                    camera_distances * torch.sin(elevation),
+                ],
+                dim=-1,
+            )
+
+            # default scene center at origin # Float[Tensor, "B 3"]
+            center = torch.zeros_like(camera_positions)
+            # default camera up direction as +z # Float[Tensor, "B 3"]
+            up = torch.as_tensor([0, 0, 1], dtype=torch.float32)[
+                None, :
+            ].repeat(self.batch_size, 1)
+
+            # sample camera perturbations from a uniform distribution [-camera_perturb, camera_perturb]
+            # Float[Tensor, "B 3"]
+            camera_perturb = (
+                torch.rand(self.batch_size, 3) * 2 * self.camera_perturb
+                - self.camera_perturb
+            )
+            camera_positions = camera_positions + camera_perturb
+            # sample center perturbations from a normal distribution with mean 0 and std center_perturb
+            # Float[Tensor, "B 3"]
+            center_perturb = (
+                torch.randn(self.batch_size, 3) * self.center_perturb
+            )
+            center = center + center_perturb
+            # sample up perturbations from a normal distribution with mean 0 and std up_perturb
+            # Float[Tensor, "B 3"]
+            up_perturb = (
+                torch.randn(self.batch_size, 3) * self.up_perturb
+            )
+            up = up + up_perturb
+
+            # sample fovs from a uniform distribution bounded by fov_range
+            # Float[Tensor, "B"]
+            fovy_deg = (
+                torch.rand(self.batch_size) * (self.fovy_range[1] - self.fovy_range[0])
+                + self.fovy_range[0]
+            )
+            fovy = fovy_deg * math.pi / 180
+
+            # Float[Tensor, "B 3"]
+            lookat = F.normalize(center - camera_positions, dim=-1)
+            # Float[Tensor, "B 3"]
+            right = F.normalize(torch.cross(lookat, up), dim=-1)
+            up = F.normalize(torch.cross(right, lookat), dim=-1)
+            # Float[Tensor, "B 3 4"]
+            c2w3x4 = torch.cat(
+                [torch.stack([right, up, -lookat], dim=-1), camera_positions[:, :, None]],
+                dim=-1,
+            )
+            # Float[Tensor, "B 4 4"]
+            c2w = torch.cat(
+                [c2w3x4, torch.zeros_like(c2w3x4[:, :1])], dim=1
+            )
+            c2w[:, 3, 3] = 1.0                
+            
+            elevation = elevation_deg
+            azimuth = azimuth_deg
+            fovx = 2 * np.arctan(np.tan(fovy / 2) * self.opt.W / self.opt.H)
+
+            for i in range(self.batch_size):
+
+                # # render random view
+                # ver = np.random.randint(min_ver, max_ver)
+                # hor = np.random.randint(-180, 180)
                 radius = 0
 
-                vers.append(ver)
-                hors.append(hor)
-                radii.append(radius)
+                # vers.append(ver)
+                # hors.append(hor)
+                # radii.append(radius)
 
-                pose = orbit_camera(self.opt.elevation + ver, hor, self.opt.radius + radius)
+                pose = orbit_camera(self.opt.elevation + elevation[i].numpy(), azimuth[i].numpy(), self.opt.radius + radius)
 
                 # random render resolution
                 ssaa = min(2.0, max(0.125, 2 * np.random.random()))
@@ -196,24 +363,43 @@ class GUI:
                 image = image.permute(2,0,1).contiguous().unsqueeze(0) # [1, 3, H, W] in [0, 1]
 
                 images.append(image)
-            
+
+                # enable mvdream training
+                if self.opt.mvdream:
+                    for view_i in range(1, 4):
+                        pose_i = orbit_camera(self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
+                        poses.append(pose_i)
+
+                        out_i = self.renderer.render(pose_i, self.cam.perspective, render_resolution, render_resolution, ssaa=ssaa)
+
+                        image = out_i["image"].permute(2,0,1).contiguous().unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                        images.append(image)
+
             images = torch.cat(images, dim=0)
+            poses = torch.from_numpy(np.stack(poses, axis=0)).to(self.device)
 
             # import kiui
             # kiui.lo(hor, ver)
             # kiui.vis.plot_image(image)
 
             # guidance loss
+            strength = step_ratio * 0.45 + 0.5 # from 0.5 to 0.95
             if self.enable_sd:
 
                 # loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, step_ratio)
                 refined_images = self.guidance_sd.refine(images, strength=0.6).float()
                 refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
                 loss = loss + self.opt.lambda_sd * F.mse_loss(images, refined_images)
+ 
+            if self.enable_mv:
+
+                refined_images = self.guidance_mv.refine(pred_rgb=images, strength=0.6, elevation=elevation, azimuth=azimuth, camera_distances=camera_distances, c2w=c2w, fovy=fovy_deg).float()
+                refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
+                loss = loss + self.opt.lambda_mv * F.mse_loss(images, refined_images)
 
             if self.enable_zero123:
                 # loss = loss + self.opt.lambda_zero123 * self.guidance_zero123.train_step(images, vers, hors, radii, step_ratio)
-                refined_images = self.guidance_zero123.refine(images, vers, hors, radii, strength=0.6).float()
+                refined_images = self.guidance_zero123.refine(images, vers, hors, radii, strength=strength).float()
                 refined_images = F.interpolate(refined_images, (render_resolution, render_resolution), mode="bilinear", align_corners=False)
                 loss = loss + self.opt.lambda_zero123 * F.mse_loss(images, refined_images)
                 # loss = loss + self.opt.lambda_zero123 * self.lpips_loss(images, refined_images)
@@ -318,9 +504,9 @@ class GUI:
                 self.prompt = f.read().strip()
     
     def save_model(self):
-        os.makedirs(self.opt.outdir, exist_ok=True)
+        os.makedirs(self.opt.save_path, exist_ok=True)
     
-        path = os.path.join(self.opt.outdir, self.opt.save_path + '.obj')
+        path = os.path.join('./experiments', opt.save_path, opt.save_path + '.' + 'obj')
         self.renderer.export_mesh(path)
 
         print(f"[INFO] save model to {path}.")
@@ -657,7 +843,7 @@ if __name__ == "__main__":
 
     # auto find mesh from stage 1
     if opt.mesh is None:
-        default_path = os.path.join(opt.outdir, opt.save_path + '_mesh.obj')
+        default_path = os.path.join('./experiments', opt.save_path, opt.save_path + '_mesh.' + 'obj')
         if os.path.exists(default_path):
             opt.mesh = default_path
         else:
@@ -669,3 +855,4 @@ if __name__ == "__main__":
         gui.render()
     else:
         gui.train(opt.iters_refine)
+
