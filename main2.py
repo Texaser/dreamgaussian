@@ -1,21 +1,21 @@
 import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import cv2
 import time
 import tqdm
 import numpy as np
-import dearpygui.dearpygui as dpg
+# import dearpygui.dearpygui as dpg
 
 import torch
 import torch.nn.functional as F
 
 import trimesh
 import rembg
-
+import random
 from cam_utils import orbit_camera, OrbitCamera
 from mesh_renderer import Renderer
 
 # from kiui.lpips import LPIPS
-
 class GUI:
     def __init__(self, opt):
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
@@ -340,9 +340,11 @@ class GUI:
                 self.prompt = f.read().strip()
     
     def save_model(self):
-        os.makedirs(self.opt.outdir, exist_ok=True)
-    
-        path = os.path.join(self.opt.outdir, self.opt.save_path + '.' + self.opt.mesh_format)
+        # os.makedirs(self.opt.outdir, exist_ok=True)
+        # os.makedirs(self.opt.save_path, exist_ok=True)
+
+        # path = os.path.join(self.opt.outdir, self.opt.save_path + '.obj')
+        path = os.path.join('./experiments', opt.save_path, opt.save_path + '.' + 'obj')
         self.renderer.export_mesh(path)
 
         print(f"[INFO] save model to {path}.")
@@ -676,10 +678,9 @@ if __name__ == "__main__":
 
     # override default config from cli
     opt = OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_cli(extras))
-
     # auto find mesh from stage 1
     if opt.mesh is None:
-        default_path = os.path.join(opt.outdir, opt.save_path + '_mesh.' + opt.mesh_format)
+        default_path = os.path.join('./experiments', opt.save_path, opt.save_path + '_mesh.' + 'obj')
         if os.path.exists(default_path):
             opt.mesh = default_path
         else:

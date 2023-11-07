@@ -40,6 +40,8 @@ for name, prompt in prompts:
     # second stage
     os.system(f'CUDA_VISIBLE_DEVICES={args.gpu} python main2.py --config configs/text.yaml  prompt="{prompt}" save_path={name}')
     # export video
-    mesh_path = os.path.join('logs', f'{name}.obj')
-    os.makedirs('videos', exist_ok=True)
-    os.system(f'python -m kiui.render {mesh_path} --save_video videos/{name}.mp4 --wogui')
+    os.system(f'CUDA_VISIBLE_DEVICES={args.gpu} python scripts/convert_obj_to_video.py --dir {name}')
+    
+    # mesh_path = os.path.join('logs', f'{name}.obj')
+    # os.makedirs('videos', exist_ok=True)
+    # os.system(f'python -m kiui.render {mesh_path} --save_video videos/{name}.mp4 --wogui')

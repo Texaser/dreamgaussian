@@ -1,8 +1,11 @@
 import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 import cv2
 import time
 import tqdm
 import numpy as np
+import random
+import math
 # import dearpygui.dearpygui as dpg
 
 import torch
@@ -52,9 +55,19 @@ class GUI:
         self.overlay_input_img = False
         self.overlay_input_img_ratio = 0.5
 
+        # camera settings
+        self.n_view = 4
+        self.elevation_range = (-30, 30)
+        self.azimuth_range = (-180, 180)
+
         # input text
         self.prompt = ""
         self.negative_prompt = ""
+        self.embeddings = {}
+        self.perpneg = True
+        self.negative_w = -2
+        self.front_decay_factor = 2
+        self.side_decay_factor = 10
 
         # training stuff
         self.training = False
@@ -101,6 +114,74 @@ class GUI:
 
         self.last_seed = seed
 
+    def adjust_text_embeddings(self, embeddings, azimuth):
+        text_z_list = []
+        weights_list = []
+        K = 0
+        for b in range(azimuth.shape[0]):
+            text_z_, weights_ = self.get_pos_neg_text_embeddings(embeddings, azimuth[b])
+            K = max(K, weights_.shape[0])
+            text_z_list.append(text_z_)
+            weights_list.append(weights_)
+
+        # Interleave text_embeddings from different dirs to form a batch
+        text_embeddings = []
+        for i in range(K):
+            for text_z in text_z_list:
+                # if uneven length, pad with the first embedding
+                text_embeddings.append(text_z[i] if i < len(text_z) else text_z[0])
+        text_embeddings = torch.stack(text_embeddings, dim=0) # [B * K, 77, 768]
+
+        # Interleave weights from different dirs to form a batch
+        weights = []
+        for i in range(K):
+            for weights_ in weights_list:
+                weights.append(weights_[i] if i < len(weights_) else torch.zeros_like(weights_[0]))
+        weights = torch.stack(weights, dim=0) # [B * K]
+        return text_embeddings, weights
+
+    def get_pos_neg_text_embeddings(self, embeddings, azimuth_val):
+        if azimuth_val >= -90 and azimuth_val < 90:
+            if azimuth_val >= 0:
+                r = 1 - azimuth_val / 90
+            else:
+                r = 1 + azimuth_val / 90
+            start_z = embeddings['front']
+            end_z = embeddings['side']
+            # if random.random() < 0.3:
+            #     r = r + random.gauss(0, 0.08)
+            pos_z = r * start_z + (1 - r) * end_z
+            text_z = torch.cat([pos_z, embeddings['front'], embeddings['side']], dim=0)
+            if r > 0.8:
+                front_neg_w = 0.0
+            else:
+                front_neg_w = math.exp(-r * self.front_decay_factor) * self.negative_w
+            if r < 0.2:
+                side_neg_w = 0.0
+            else:
+                side_neg_w = math.exp(-(1-r) * self.side_decay_factor) * self.negative_w
+
+            weights = torch.tensor([1.0, front_neg_w, side_neg_w])
+        else:
+            if azimuth_val >= 0:
+                r = 1 - (azimuth_val - 90) / 90
+            else:
+                r = 1 + (azimuth_val + 90) / 90
+            start_z = embeddings['side']
+            end_z = embeddings['back']
+            # if random.random() < 0.3:
+            #     r = r + random.gauss(0, 0.08)
+            pos_z = r * start_z + (1 - r) * end_z
+            text_z = torch.cat([pos_z, embeddings['side'], embeddings['front']], dim=0)
+            front_neg_w = self.negative_w 
+            if r > 0.8:
+                side_neg_w = 0.0
+            else:
+                side_neg_w = math.exp(-r * self.side_decay_factor) * self.negative_w / 2
+
+            weights = torch.tensor([1.0, side_neg_w, front_neg_w])
+        return text_z, weights.to(text_z.device)
+    
     def prepare_train(self):
 
         self.step = 0
@@ -157,8 +238,11 @@ class GUI:
         with torch.no_grad():
 
             if self.enable_sd:
-                self.guidance_sd.get_text_embeds([self.prompt], [self.negative_prompt])
-
+                # self.embeddings = self.guidance_sd.get_text_embed([self.prompt], [self.negative_prompt])
+                self.embeddings['default'] = self.guidance_sd.get_text_embeds([self.prompt])
+                self.embeddings['uncond'] = self.guidance_sd.get_text_embeds([self.negative_prompt])
+                for d in ['front', 'side', 'back']:
+                    self.embeddings[d] = self.guidance_sd.get_text_embeds([f"{self.prompt}, {d} view"])
             if self.enable_zero123:
                 self.guidance_zero123.get_img_embeds(self.input_img_torch)
 
@@ -194,23 +278,66 @@ class GUI:
             render_resolution = 128 if step_ratio < 0.3 else (256 if step_ratio < 0.6 else 512)
             images = []
             poses = []
-            vers, hors, radii = [], [], []
+            # vers, hors, radii = [], [], []
+            radii = []
             # avoid too large elevation (> 80 or < -80), and make sure it always cover [-30, 30]
-            min_ver = max(min(-30, -30 - self.opt.elevation), -80 - self.opt.elevation)
-            max_ver = min(max(30, 30 - self.opt.elevation), 80 - self.opt.elevation)
+            # min_ver = max(min(-30, -30 - self.opt.elevation), -80 - self.opt.elevation)
+            # max_ver = min(max(30, 30 - self.opt.elevation), 80 - self.opt.elevation)
 
             for _ in range(self.opt.batch_size):
 
                 # render random view
-                ver = np.random.randint(min_ver, max_ver)
-                hor = np.random.randint(-180, 180)
-                radius = 0
+                # ver = np.random.randint(min_ver, max_ver)
+                # hor = np.random.randint(-180, 180)
+                if random.random() < 0.5:
+                    ver = (np.random.rand() * (self.elevation_range[1] - self.elevation_range[0]) + self.elevation_range[0])
+                else:
+                    elevation_range_percent = [
+                        (self.elevation_range[0] + 90.0) / 180.0,
+                        (self.elevation_range[1] + 90.0) / 180.0,
+                    ]
+                    # inverse transform sampling
+                    elevation = np.arcsin(
+                        2 * (np.random.rand()
+                            * (elevation_range_percent[1] - elevation_range_percent[0])
+                            + elevation_range_percent[0]) - 1.0
+                    )
+                    ver = elevation / math.pi * 180.0
+                
+                hors = (np.random.rand(self.opt.batch_size * self.n_view) + np.arange(self.opt.batch_size * self.n_view)) / (self.opt.batch_size * self.n_view) * (
+                    self.azimuth_range[1] - self.azimuth_range[0]) + self.azimuth_range[0]
 
-                vers.append(ver)
-                hors.append(hor)
+                text_z = [self.embeddings['uncond']] * hors.shape[0]
+
+                if self.perpneg:
+                    text_z_comp, weights = self.adjust_text_embeddings(self.embeddings, hors)
+                    text_z.append(text_z_comp)
+                else:
+                    for b in range(azimuth.shape[0]):
+                        if azimuth[b] >= -90 and azimuth[b] < 90:
+                            if azimuth[b] >= 0:
+                                r = 1 - azimuth[b] / 90
+                            else:
+                                r = 1 + azimuth[b] / 90
+                            start_z = self.embeddings['front']
+                            end_z = self.embeddings['side']
+                        else:
+                            if azimuth[b] >= 0:
+                                r = 1 - (azimuth[b] - 90) / 90
+                            else:
+                                r = 1 + (azimuth[b] + 90) / 90
+                            start_z = self.embeddings['side']
+                            end_z = self.embeddings['back']
+                        text_z.append(r * start_z + (1 - r) * end_z)
+
+                text_z = torch.cat(text_z, dim=0)
+                radius = 0  
+
+                # vers.append(ver)
+                # hors.append(hor)
                 radii.append(radius)
 
-                pose = orbit_camera(self.opt.elevation + ver, hor, self.opt.radius + radius)
+                pose = orbit_camera(self.opt.elevation + ver, hors[0], self.opt.radius + radius)
                 poses.append(pose)
 
                 cur_cam = MiniCam(pose, render_resolution, render_resolution, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
@@ -224,7 +351,7 @@ class GUI:
                 # enable mvdream training
                 if self.opt.mvdream:
                     for view_i in range(1, 4):
-                        pose_i = orbit_camera(self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
+                        pose_i = orbit_camera(self.opt.elevation + ver, hors[view_i], self.opt.radius + radius)
                         poses.append(pose_i)
 
                         cur_cam_i = MiniCam(pose_i, render_resolution, render_resolution, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
@@ -245,7 +372,8 @@ class GUI:
             # guidance loss
             if self.enable_sd:
                 if self.opt.mvdream:
-                    loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, poses, step_ratio)
+                    # loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, poses, self.step, step_ratio)
+                    loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step_perpneg(images, text_z, weights, poses, self.step, step_ratio)
                 else:
                     loss = loss + self.opt.lambda_sd * self.guidance_sd.train_step(images, step_ratio)
 
@@ -387,16 +515,18 @@ class GUI:
 
     @torch.no_grad()
     def save_model(self, mode='geo', texture_size=1024):
-        os.makedirs(self.opt.outdir, exist_ok=True)
+        # os.makedirs(self.opt.outdir, exist_ok=True)
+        os.makedirs(f'./experiments/{self.opt.save_path}', exist_ok=True)
         if mode == 'geo':
-            path = os.path.join(self.opt.outdir, self.opt.save_path + '_mesh.ply')
+            # path = os.path.join(self.opt.outdir, self.opt.save_path + '_mesh.ply')
+            path = os.path.join('./experiments', self.opt.save_path, self.opt.save_path + '_mesh.ply')
             mesh = self.renderer.gaussians.extract_mesh(path, self.opt.density_thresh)
             mesh.write_ply(path)
 
         elif mode == 'geo+tex':
-            path = os.path.join(self.opt.outdir, self.opt.save_path + '_mesh.' + self.opt.mesh_format)
-            mesh = self.renderer.gaussians.extract_mesh(path, self.opt.density_thresh)
-
+            # path = os.path.join(self.opt.outdir, self.opt.save_path + '_mesh.obj')
+            path = os.path.join('./experiments', self.opt.save_path, self.opt.save_path + '_mesh.obj')
+            mesh = self.renderer.gaussians.extract_mesh(path, self.opt.density_thresh)   
             # perform texture extraction
             print(f"[INFO] unwrap uv...")
             h = w = texture_size
@@ -522,7 +652,7 @@ class GUI:
             mesh.write(path)
 
         else:
-            path = os.path.join(self.opt.outdir, self.opt.save_path + '_model.ply')
+            path = os.path.join('./experiments', self.opt.save_path, self.opt.save_path + '_model.ply')
             self.renderer.gaussians.save_ply(path)
 
         print(f"[INFO] save model to {path}.")
@@ -892,7 +1022,7 @@ if __name__ == "__main__":
 
     # override default config from cli
     opt = OmegaConf.merge(OmegaConf.load(args.config), OmegaConf.from_cli(extras))
-
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
     gui = GUI(opt)
 
     if opt.gui:
